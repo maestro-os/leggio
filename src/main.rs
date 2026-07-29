@@ -34,7 +34,7 @@ use smithay::wayland::shell::xdg::{
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use std::num::Wrapping;
 use std::sync::Arc;
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::Instant;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
