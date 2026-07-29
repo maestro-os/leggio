@@ -1,6 +1,8 @@
 // TODO handle unwraps
 
-use smithay::backend::input::{InputEvent, KeyboardKeyEvent};
+use smithay::backend::input::{
+    AbsolutePositionEvent, InputEvent, KeyboardKeyEvent, PointerButtonEvent,
+};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
@@ -11,6 +13,7 @@ use smithay::backend::renderer::{Color32F, Frame, Renderer};
 use smithay::backend::winit;
 use smithay::backend::winit::WinitEvent;
 use smithay::input::keyboard::FilterResult;
+use smithay::input::pointer::{ButtonEvent, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
@@ -29,8 +32,9 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use std::num::Wrapping;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -136,7 +140,7 @@ fn main() {
     let shm_state = ShmState::new::<Server>(&display_handle, vec![]);
     let mut seat_state = SeatState::new();
     let seat = seat_state.new_wl_seat(&display_handle, "winit");
-    let mut state = Server {
+    let mut server = Server {
         compositor_state,
         xdg_shell_state,
         seat,
@@ -147,18 +151,23 @@ fn main() {
     let mut clients = Vec::new();
     let (mut backend, mut winit) = winit::init::<GlesRenderer>().unwrap();
     let start_time = Instant::now();
-    let keyboard = state
+    let pointer = server.seat.add_pointer();
+    let mut pointer_serial = Wrapping::<u32>::default();
+    let keyboard = server
         .seat
         .add_keyboard(Default::default(), 200, 200)
         .unwrap();
 
     loop {
+        // size of the winit window, used to turn normalized pointer coordinates into
+        // compositor-space ones
+        let window_size = backend.window_size().to_logical(1);
         let status = winit.dispatch_new_events(|event| match event {
             WinitEvent::Resized { .. } => {}
             WinitEvent::Input(event) => match event {
                 InputEvent::Keyboard { event } => {
                     keyboard.input::<(), _>(
-                        &mut state,
+                        &mut server,
                         event.key_code(),
                         event.state(),
                         0.into(),
@@ -166,17 +175,47 @@ fn main() {
                         |_, _, _| FilterResult::Forward,
                     );
                 }
-                InputEvent::PointerMotionAbsolute { .. } => {
-                    let toplevel = state
+                InputEvent::PointerMotionAbsolute { event } => {
+                    let toplevel = server
                         .xdg_shell_state
                         .toplevel_surfaces()
                         .iter()
                         .next()
                         .cloned();
+                    let focus = toplevel
+                        .as_ref()
+                        .map(|surface| (surface.wl_surface().clone(), (0.0, 0.0).into()));
+                    let serial = pointer_serial.0;
+                    pointer_serial += 1;
+                    let serial = Serial::from(serial);
+                    pointer.motion(
+                        &mut server,
+                        focus,
+                        &MotionEvent {
+                            location: event.position_transformed(window_size),
+                            serial,
+                            time: start_time.elapsed().as_millis() as _,
+                        },
+                    );
+                    pointer.frame(&mut server);
                     if let Some(surface) = toplevel {
                         let surface = surface.wl_surface().clone();
-                        keyboard.set_focus(&mut state, Some(surface), 0.into());
+                        keyboard.set_focus(&mut server, Some(surface), serial);
                     }
+                }
+                InputEvent::PointerButton { event } => {
+                    let serial = pointer_serial.0;
+                    pointer_serial += 1;
+                    pointer.button(
+                        &mut server,
+                        &ButtonEvent {
+                            serial: Serial::from(serial),
+                            time: start_time.elapsed().as_millis() as _,
+                            button: event.button_code(),
+                            state: event.state(),
+                        },
+                    );
+                    pointer.frame(&mut server);
                 }
                 _ => {}
             },
@@ -192,7 +231,7 @@ fn main() {
         let damage = Rectangle::from_size(size);
         {
             let (renderer, mut framebuffer) = backend.bind().unwrap();
-            let elements = state
+            let elements = server
                 .xdg_shell_state
                 .toplevel_surfaces()
                 .iter()
@@ -218,7 +257,7 @@ fn main() {
             let _ = frame.finish().unwrap();
 
             let elapsed = start_time.elapsed().as_millis() as u32;
-            for surface in state.xdg_shell_state.toplevel_surfaces() {
+            for surface in server.xdg_shell_state.toplevel_surfaces() {
                 send_frames_surface_tree(surface.wl_surface(), elapsed);
             }
 
@@ -231,7 +270,7 @@ fn main() {
                 clients.push(client);
             }
 
-            display.dispatch_clients(&mut state).unwrap();
+            display.dispatch_clients(&mut server).unwrap();
             display.flush_clients().unwrap();
         }
         backend.submit(Some(&[damage])).unwrap();
